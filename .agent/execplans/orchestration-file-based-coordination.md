@@ -1,6 +1,10 @@
 # Execution Plan: File-Based Worker Orchestration System
 
-Status: in progress. Last updated: 2026-07-18 (initial authoring).
+Status: implementation complete, all validation passing. The one item
+that is intentionally NOT "finalized" is the default human-gates list in
+`gates.json` -- that is a proposal awaiting operator review, by design
+(see goal 5 in the originating prompt and the Outcomes section below).
+Last updated: 2026-07-18.
 
 ## Purpose / Big Picture
 
@@ -43,7 +47,7 @@ recomputed fresh on every request.
 - [x] 2026-07-18 — Dashboard (`dashboard/server.py`, `dashboard/index.html`). Verified live in an actual browser against seeded disposable data, not just by reading the code: worker table correctly showed real staleness (orchestrator/fast-worker genuinely stalled relative to their declared interval, slow-worker correctly "no heartbeat yet"), fan-out cap and task tables matched disk state, and the Approve flow was driven end to end (typed a note, clicked Approve, confirmed the pending item moved to `operator-pending/resolved/` on disk with that exact note). Found and fixed two real bugs in the process — see Surprises & Discoveries.
 - [x] 2026-07-18 — Operator CLI scripts (`scripts/submit_task.py`, `scripts/resolve_pending.py`). Smoke-tested directly (create a task via CLI, read it back; file+resolve a pending item via CLI, confirm resolved copy on disk).
 - [x] 2026-07-18 — Validation suite (`scripts/run_validation.py`) covering every item in Validation and Acceptance, run against real subprocesses (`kill -9` on an actual PID, real concurrent Python processes, a real HTTP server) with isolated disposable state per item. **ALL PASS (9/9)** on a clean run.
-- [ ] Outcomes & Retrospective written; final summary delivered; gates config flagged for operator review.
+- [x] 2026-07-18 — Outcomes & Retrospective written; final summary delivered; gates config flagged for operator review.
 
 ## Surprises & Discoveries
 
@@ -186,10 +190,104 @@ appended below as they occur.)*
 
 ## Outcomes & Retrospective
 
-**Not yet written.** This section is filled in honestly at the end of
-implementation, against what actually happened — not against what the
-plan predicted. If you are reading this line, implementation is still in
-progress; check the Progress checklist above for current state.
+Written after implementation and a full, passing validation run.
+Assessed against the self-reflection bar from the originating prompt:
+*if you `kill -9` the relevant process at the worst plausible moment,
+does a fresh process recover correctly from disk alone with no
+double-dispatch and no lost work; does anything still depend on a model
+remembering something across a restart; does an intentional shutdown
+look different from a crash; is the fan-out cap actually enforced by
+code; can you demonstrate each of these using the example workers, not
+just argue it in prose.* Every claim below is backed by an item in
+`scripts/run_validation.py`, which passes in full (9/9) as of this
+writing — not asserted from reading the code.
+
+1. **Durable state, not memory — fully implemented.** Every worker,
+   including the orchestrator itself, has a `state.json` written only
+   via atomic replace (`orchestrator/common.py`'s `atomic_write_json`),
+   never append. Validation item 1 kills `slow-worker` with a real
+   `SIGKILL` mid-task and confirms a fresh process resumes and completes
+   using only `state.json` and the still-present mailbox message — no
+   double-execution, no lost work, no dependence on anything held in a
+   process's memory or in this conversation.
+2. **Mailbox-file messaging — fully implemented.** One file per message,
+   temp-then-rename writes so a reader never observes a partial file,
+   timestamp-plus-random-suffix filenames that sort chronologically
+   without a shared counter, `done/` as a permanent, never-pruned record.
+   Validation item 2 runs two real separate OS processes writing 25
+   messages each into the same inbox simultaneously: 50 valid files
+   result, none corrupted, per-sender order preserved.
+3. **One deterministic tick loop — fully implemented.** Gather is pure
+   disk-reading code with no model or judgment call involved. Advance
+   writes an intent line to `state/orchestrator/dispatch_log.jsonl`
+   before sending, and only flips a task's status after the send
+   succeeds; validation item 3 simulates a crash landing exactly between
+   those two steps and confirms the next tick recovers to exactly one
+   dispatch, never zero, never two. The fan-out cap
+   (`config.MAX_CONCURRENT_HEAVY = 1`) is a real constant the dispatch
+   code refuses to exceed — validation item 5 submits two heavy tasks and
+   confirms only one is ever dispatched while the other holds at
+   `pending`. Render only writes a log line and updates its summary file
+   when the computed hash actually changes from the previous tick.
+4. **Heartbeats instead of trust — fully implemented**, including the
+   asymmetric case goal 4 specifically calls for: `slow-worker` re-stamps
+   its own heartbeat with a longer `interval_seconds` immediately before
+   starting simulated long work. Validation items 4a/4b/4c confirm, in
+   order: a worker mid-long-task is never falsely flagged stalled because
+   its own re-stamped interval scaled the 2.5x staleness window; a worker
+   that goes genuinely silent past 2.5x its declared interval IS flagged;
+   and a worker that stands down on purpose (`--stand-down`) reads as
+   `stood_down` / not-stalled regardless of subsequent age, distinct from
+   silence.
+5. **Human gates — fully implemented** as data in `gates.json`, read by
+   `orchestrator/gates.py`, never hardcoded into control flow — an
+   action type not listed there runs unattended, by design. The
+   `operator-pending/` queue never expires and only ever moves to
+   `resolved/` via an explicit `approved`/`denied` decision (through
+   either `scripts/resolve_pending.py` or the dashboard's own buttons,
+   both calling the identical `gates.resolve_pending` function).
+   Validation item 6 drives the entire path with a real example task:
+   `slow-worker` refuses a gated `external_notify` action, opens a
+   pending item, an operator approves it via the CLI, and the worker
+   notices and completes the task — proven end to end, not asserted.
+   **The proposed default gate list itself is the one deliberately
+   unfinished piece of this plan — see the callout immediately below.**
+6. **Example workers — fully implemented and load-bearing**, not
+   decorative. `examples/fast_worker.py` and `examples/slow_worker.py`
+   are what every other validation item above actually runs against;
+   none of goals 1 through 5 are demonstrated without them, and both are
+   clearly marked as fixtures in their own module docstrings.
+
+No stop condition was ever hit (no credential was needed, nothing
+destructive against real state was required, and every tool used —
+Python 3 standard library, a browser for the dashboard — was already
+available). The language/runtime, tick interval, fan-out cap value,
+staleness multiplier, and `gates.json`-over-`gates.yaml` choices were
+all made unilaterally and recorded in the Decision Log, per the prompt's
+explicit instruction not to come back and ask about those.
+
+**Bugs actually found and fixed during implementation** (not merely
+anticipated — see Surprises & Discoveries for the full detail on each):
+the documented direct-invocation style (`python3 orchestrator/tick.py
+--once`) initially failed with `ModuleNotFoundError` because Python
+doesn't put the repository root on `sys.path` when a script is run that
+way; the dashboard's Approve/Deny buttons originally used a blocking
+`prompt()` that hung with no error; and the dashboard's operator-pending
+section rebuilt its DOM unconditionally on every poll, which would have
+silently erased a note a human was mid-way through typing. All three
+were caught by actually running the documented commands and actually
+driving the dashboard in a live browser — not by re-reading the source —
+which is the same "describe outcomes a person can observe and verify"
+discipline this plan asked of itself in `.agent/PLANS.md`.
+
+**What is genuinely incomplete, and why that's the correct amount of
+incompleteness:** the default gate list in `gates.json` is a proposal,
+not a finalized policy. This is not a gap in the implementation — the
+originating prompt explicitly asked for this one piece to be flagged
+rather than silently decided, since which actions warrant a human stop
+is a risk-tolerance judgment call for the operator, not a technical one.
+Every other design decision in this plan was made unilaterally and is
+genuinely finished.
 
 ## Context and Orientation
 
