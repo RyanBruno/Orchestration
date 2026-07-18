@@ -1,0 +1,21 @@
+# Runtime data: durability comes from atomic on-disk writes (the whole
+# point of this system), not from git history of every heartbeat tick.
+# See the execution plan's Decision Log for the full reasoning.
+/state/**
+/mailboxes/**
+/heartbeats/**
+/operator-pending/**
+/logs/**
+!/state/.gitkeep
+!/mailboxes/.gitkeep
+!/heartbeats/.gitkeep
+!/operator-pending/.gitkeep
+!/logs/.gitkeep
+
+__pycache__/
+*.pyc
+
+# Unrelated content observed mid-session, not part of this task -- see
+# chat: appeared in a directory named "don't touch," left alone and kept
+# out of version control here rather than silently swept in by `git add -A`.
+/dont_touch_prompts.md/
