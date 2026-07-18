@@ -36,10 +36,10 @@ recomputed fresh on every request.
 
 - [x] 2026-07-18 — Repo scaffolding: `AGENTS.md`, `.agent/PLANS.md` written and committed.
 - [x] 2026-07-18 — This plan authored.
-- [ ] Shared library (`orchestrator/common.py`, `orchestrator/config.py`): atomic writes, mailbox send/receive, heartbeat read/staleness, ISO timestamp helpers.
-- [ ] Gates config (`gates.json`) and operator-pending helpers (`orchestrator/gates.py`).
-- [ ] Orchestrator tick loop (`orchestrator/tick.py`): Gather/Process-inbox/Advance/Render, dispatch journal, fan-out cap.
-- [ ] Example workers (`examples/worker_common.py`, `examples/fast_worker.py`, `examples/slow_worker.py`).
+- [x] 2026-07-18 — Shared library (`orchestrator/common.py`, `orchestrator/config.py`): atomic writes, mailbox send/receive, heartbeat read/staleness, ISO timestamp helpers. Smoke-tested directly (heartbeat write/read, mailbox send/read/complete, worker state round-trip, jsonl append/read).
+- [x] 2026-07-18 — Gates config (`gates.json`) and operator-pending helpers (`orchestrator/gates.py`). Smoke-tested (is_gated hit/miss, file/list/resolve pending, get_resolved).
+- [x] 2026-07-18 — Orchestrator tick loop (`orchestrator/tick.py`): Gather/Process-inbox/Advance/Render, dispatch journal, fan-out cap. Directly exercised all three dispatch-journal crash windows (never sent, sent-not-flipped, flipped-not-committed) and the fan-out cap — all recovered/enforced correctly; see Surprises & Discoveries.
+- [x] 2026-07-18 — Example workers (`examples/worker_common.py`, `examples/fast_worker.py`, `examples/slow_worker.py`). Directly exercised: baseline dispatch/claim/complete, the gate path end to end (file pending -> approve -> resume -> complete), and `kill -9` mid-heavy-task recovery (state showed `in_progress` before and after the kill; fresh process resumed and completed exactly once, verified via `done/` containing exactly one file per task). Also found and fixed a real bug here — see Surprises & Discoveries.
 - [ ] Dashboard (`dashboard/server.py`, `dashboard/index.html`).
 - [ ] Operator CLI scripts (`scripts/submit_task.py`, `scripts/resolve_pending.py`).
 - [ ] Validation suite (`scripts/run_validation.sh`) covering every item in Validation and Acceptance, run and passing.
@@ -64,6 +64,20 @@ appended below as they occur.)*
   `inbox/.tmp-x` → `inbox/x`, never across directories), but it's worth
   stating explicitly since it's the one thing that would silently break
   the whole crash-safety story if violated.
+- **Real bug found and fixed**: the documented direct-invocation style
+  (`python3 orchestrator/tick.py --once`) initially failed with
+  `ModuleNotFoundError: No module named 'orchestrator'`. Python sets
+  `sys.path[0]` to the *script's own directory* when run this way (here,
+  `orchestrator/` itself), not the repository root and not the caller's
+  cwd -- so `from orchestrator import common` inside `tick.py` couldn't
+  resolve. Fixed by inserting the repo root into `sys.path` at the top of
+  every entry-point script (`orchestrator/tick.py`,
+  `examples/fast_worker.py`, `examples/slow_worker.py`, and later
+  `dashboard/server.py` and the `scripts/*.py` CLIs) before importing
+  anything from the `orchestrator` package. Caught by actually running
+  the documented command, not by reading the code -- a reminder that
+  "the code compiles" and "the documented command works" are genuinely
+  different claims.
 - Python's `time.time()`-based ISO timestamps need explicit UTC and
   microsecond precision for mailbox filename ordering to be unambiguous
   under rapid sends; using `datetime.now(timezone.utc)` with

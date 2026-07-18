@@ -1,0 +1,50 @@
+{
+  "_comment": "PROPOSED DEFAULT LIST -- review and edit before relying on this in a real deployment. This is a risk-tolerance judgment call for the operator, not a purely technical one. Autonomy is the default: any action_type NOT listed here runs unattended. Categories follow the four named in the originating spec: irreversible, trust_boundary, ambiguous_authorization, spend_scope_policy.",
+  "gates": [
+    {
+      "action_type": "delete_data",
+      "category": "irreversible",
+      "reason": "Permanently destroying data cannot be undone by this system; a human must confirm intent first."
+    },
+    {
+      "action_type": "merge_branch",
+      "category": "irreversible",
+      "reason": "Merging changes history other people build on top of; reverting is possible but disruptive, so treat as effectively irreversible."
+    },
+    {
+      "action_type": "publish_release",
+      "category": "irreversible",
+      "reason": "Once published, a release is consumed by others; it cannot be quietly un-published."
+    },
+    {
+      "action_type": "send_external_message",
+      "category": "trust_boundary",
+      "reason": "Anything leaving this system to a real external recipient (email, chat, webhook) cannot be recalled and is also irreversible once sent."
+    },
+    {
+      "action_type": "write_unauthorized_repo",
+      "category": "trust_boundary",
+      "reason": "Writing to a repository or account not already explicitly pre-authorized crosses a boundary the operator has not yet agreed to."
+    },
+    {
+      "action_type": "external_notify",
+      "category": "trust_boundary",
+      "reason": "Example/demo gated action type used by the fixture workers under examples/ to exercise the full gate -> operator-pending -> resolution path end to end. Remove once real gated action types replace the fixtures, or keep as a template for how to add a new gate."
+    },
+    {
+      "action_type": "worker_escalation",
+      "category": "ambiguous_authorization",
+      "reason": "A worker's own signal that it cannot tell whether it is allowed to do something. Always gated: escalate rather than assume broader permission for itself."
+    },
+    {
+      "action_type": "spend_above_threshold",
+      "category": "spend_scope_policy",
+      "reason": "Any action with an associated real-world cost above whatever threshold the operator sets is a spend decision, not an execution decision."
+    },
+    {
+      "action_type": "policy_change",
+      "category": "spend_scope_policy",
+      "reason": "Changes to this file, the fan-out cap, or the pre-approved-repo list are policy decisions about what the system is allowed to do, not task execution -- they must not be able to loosen their own constraints unattended."
+    }
+  ]
+}
