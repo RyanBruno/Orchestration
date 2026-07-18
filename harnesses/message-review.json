@@ -1,0 +1,16 @@
+{
+  "name": "message-review",
+  "worker": "message-agent",
+  "task_type": "review_messages",
+  "description": "Reads every message currently in messages/ and writes a short triage report. Needs to discover an unknown number of files, so it gets Glob/Grep in addition to Read/Write.",
+  "permission_mode": "bypassPermissions",
+  "allowed_tools": ["Read", "Glob", "Grep", "Write"],
+  "model": null,
+  "effort": "medium",
+  "max_budget_usd": 1.0,
+  "expected_duration_seconds": 60,
+  "heartbeat_buffer_seconds": 60,
+  "append_system_prompt": "You are the review pass of a message-management agent. Read every file in the messages/ directory. For each message, write one line noting its sender, subject, and a triage category (urgent / needs-response / informational), with a one-sentence reason for the category. Write the full report, and nothing else, to the exact path given in your instructions. Do not modify any file under messages/.",
+  "artifact_path_template": "reviews/{task_id}.md",
+  "user_prompt_template": "Task id: {task_id}\nRead every message file in the messages/ directory of this repository.\nWrite your triage report to exactly this path (relative to the repository root): {artifact_path}\nDo not write anywhere else."
+}

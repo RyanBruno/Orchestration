@@ -1,0 +1,16 @@
+{
+  "name": "message-respond",
+  "worker": "message-agent",
+  "task_type": "draft_response",
+  "description": "Drafts a reply to one specific, named message. The message file to read is always given directly in the prompt, so this harness has no need to search or discover files -- it gets a strictly narrower tool set than message-review/message-summarize (no Glob, no Grep).",
+  "permission_mode": "bypassPermissions",
+  "allowed_tools": ["Read", "Write"],
+  "model": null,
+  "effort": "medium",
+  "max_budget_usd": 1.0,
+  "expected_duration_seconds": 45,
+  "heartbeat_buffer_seconds": 45,
+  "append_system_prompt": "You are the response-drafting pass of a message-management agent. You will be told the exact path of one message file to read. Read only that file. Draft a clear, professional reply to it. Write the full draft reply, and nothing else, to the exact path given in your instructions. Do not modify the original message file.",
+  "artifact_path_template": "drafts/{task_id}.md",
+  "user_prompt_template": "Task id: {task_id}\nRead exactly this one message file (relative to the repository root): messages/{message_file}\nDraft a reply to it.\nWrite your drafted reply to exactly this path (relative to the repository root): {artifact_path}\nDo not write anywhere else."
+}
