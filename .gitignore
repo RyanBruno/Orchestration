@@ -15,6 +15,18 @@
 __pycache__/
 *.pyc
 
+# workers/message-agent/repo/ is a live git repository the worker itself
+# owns (worktrees, task branches, merge commits) -- a nested .git cannot
+# be tracked as plain files by this outer repo (git always represents a
+# directory containing its own .git as a single opaque gitlink, even with
+# --separate-git-dir). Its human-authored seed content (CLAUDE.md, the
+# real test message files) lives in the tracked workers/message-agent/seed/
+# instead; magent_config.ensure_repo_bootstrapped() materializes repo/
+# from that seed on first use, exactly once, idempotently. See the
+# execution plan's Decision Log.
+/workers/message-agent/repo/
+/workers/message-agent/worktrees/
+
 # Unrelated content observed mid-session, not part of this task -- see
 # chat: appeared in a directory named "don't touch," left alone and kept
 # out of version control here rather than silently swept in by `git add -A`.

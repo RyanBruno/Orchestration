@@ -66,6 +66,7 @@ def main():
         print(json.dumps({"action": "stood_down"}))
         return
 
+    magent_config.ensure_repo_bootstrapped()
     harnesses_by_task_type = _load_harnesses_for_this_worker()
 
     def _cycle():
