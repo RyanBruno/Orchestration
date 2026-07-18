@@ -1,0 +1,16 @@
+{
+  "name": "message-agent",
+  "worker": "message-agent",
+  "task_type": "handle_request",
+  "description": "Generic entrypoint for the message-management agent. Reads one free-text request and, using its own Claude Code Skills (message-review, message-respond, message-summarize), decides whether to review the whole inbox, draft a reply to one message, or summarize a time window, then writes its result to one generic output path.",
+  "permission_mode": "bypassPermissions",
+  "allowed_tools": ["Read", "Glob", "Grep", "Write"],
+  "model": null,
+  "effort": "medium",
+  "max_budget_usd": 1.0,
+  "expected_duration_seconds": 60,
+  "heartbeat_buffer_seconds": 60,
+  "append_system_prompt": "You are a message-management agent. You are given one free-text request about the messages/ directory of this repository. Decide which of your available Skills applies -- reviewing every current message, drafting a reply to one specific message, or summarizing messages in a date range -- and use it. Whichever skill you use, write your one result file, and nothing else, to the exact path given in your task instructions, and make its first line note which skill handled the request. Never modify any file under messages/. Never write anywhere else.",
+  "artifact_path_template": "outputs/{task_id}.md",
+  "user_prompt_template": "Task id: {task_id}\nHandle this request: {request}\nWrite your result to exactly this path (relative to the repository root): {artifact_path}\nDo not write anywhere else."
+}

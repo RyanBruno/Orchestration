@@ -452,9 +452,15 @@ def _run_worker_until_terminal(env, max_calls=4, timeout=120):
 
 def _item8_kill_recover(msg_repo, env):
     """Goal 2: kill -9 mid-agent-session, resume not restart -- proven
-    against a live session, not argued in prose.
+    against a live session, not argued in prose. Dispatched through the
+    single generic handle_request task type/harness introduced by
+    .agent/execplans/message-agent-skills-dispatch.md; the recovered
+    session must still have correctly selected the review skill.
     """
-    task_id = create_task("message-agent", "review_messages", env)
+    task_id = create_task(
+        "message-agent", "handle_request", env,
+        payload={"request": "Review every message currently in the inbox and produce a triage report."},
+    )
     run(["orchestrator/tick.py", "--once"], env)
 
     proc = _run_worker_bg(env)
@@ -516,15 +522,17 @@ def _item8_kill_recover(msg_repo, env):
 
     pending = list_pending(env)
     pending_id = pending[0]["id"] if pending else None
-    on_main_before_approval = (msg_repo / "reviews" / f"{task_id}.md").exists()
+    on_main_before_approval = (msg_repo / "outputs" / f"{task_id}.md").exists()
 
     if pending_id:
         run(["scripts/resolve_pending.py", pending_id, "approve", "--note", "validation suite approval"], env)
     _run_worker_until_terminal(env)
     run(["orchestrator/tick.py", "--once"], env)
 
-    artifact = msg_repo / "reviews" / f"{task_id}.md"
+    artifact = msg_repo / "outputs" / f"{task_id}.md"
     on_main_after_approval = artifact.exists() and artifact.stat().st_size > 0
+    first_line = artifact.read_text().splitlines()[0] if on_main_after_approval else ""
+    recovered_correct_skill = first_line == "Handled by: message-review skill"
     final_status = read_task_status(task_id, env)
 
     ok = (
@@ -534,6 +542,7 @@ def _item8_kill_recover(msg_repo, env):
         and reached_merge_wait
         and not on_main_before_approval
         and on_main_after_approval
+        and recovered_correct_skill
         and final_status == "done"
     )
     record(
@@ -543,90 +552,133 @@ def _item8_kill_recover(msg_repo, env):
         f"resumed_same_session={resumed_same_session} (orig={session_id!r}, first_resume={first_resume_result.get('agent_session_id')!r}), "
         f"reached_merge_wait={reached_merge_wait} (last_action={latest_result.get('action')!r}), "
         f"on_main_before={on_main_before_approval} (want False), on_main_after={on_main_after_approval} (want True), "
-        f"final_status={final_status!r}",
+        f"recovered_correct_skill={recovered_correct_skill} (first_line={first_line!r}), final_status={final_status!r}",
     )
 
 
-def _item9_harness_difference(msg_repo, env):
-    """Goal 3 (and goal 4's isolation again, on a second task type):
-    a different task type, dispatched through the identical
-    run_agent_task_cycle code path, actually behaves differently because
-    its harness differs -- not because of any per-task-type Python.
+def _item9_three_skills_fire(msg_repo, env):
+    """Goal 6, the direct proof this plan exists to deliver: three
+    free-text requests, all dispatched through the IDENTICAL task type
+    (handle_request) and the IDENTICAL harness
+    (harnesses/message-agent.json), must each be handled by a different
+    skill -- confirmed from the actual outputs/<task_id>.md content and
+    its "Handled by:" line for each, never asserted from reading the
+    skill descriptions.
     """
-    review_harness = json.loads((REPO_ROOT / "harnesses" / "message-review.json").read_text())
-    respond_harness = json.loads((REPO_ROOT / "harnesses" / "message-respond.json").read_text())
-    tools_differ = set(respond_harness["allowed_tools"]) < set(review_harness["allowed_tools"])
+    cases = [
+        ("review", "Review everything currently in the inbox and flag anything urgent.",
+         "Handled by: message-review skill"),
+        ("respond", "Draft a reply to Dave's message about rescheduling Friday's meeting.",
+         "Handled by: message-respond skill"),
+        ("summarize", "Summarize everything that came in between July 12 and July 14, 2026.",
+         "Handled by: message-summarize skill"),
+    ]
+    content_checks = {
+        "review": lambda c: sum(name in c.lower() for name in ("alice", "bob", "carol", "dave")) >= 2,
+        "respond": lambda c: "reschedul" in c.lower() or "friday" in c.lower(),
+        "summarize": lambda c: ("bob" in c.lower() or "carol" in c.lower() or "outage" in c.lower() or "newsletter" in c.lower())
+        and "dave" not in c.lower() and "alice" not in c.lower(),
+    }
 
-    message_file = "20260716T110000-dave-reschedule-fridays-meeting.md"
-    task_id = create_task("message-agent", "draft_response", env, payload={"message_file": message_file})
-    run(["orchestrator/tick.py", "--once"], env)
-    result = _run_worker_until_terminal(env)
+    results = {}
+    for label, request_text, expected_header in cases:
+        task_id = create_task("message-agent", "handle_request", env, payload={"request": request_text})
+        run(["orchestrator/tick.py", "--once"], env)
+        cycle_result = _run_worker_until_terminal(env)
 
-    pending = list_pending(env)
-    pending_id = pending[0]["id"] if pending else None
-    on_main_before_approval = (msg_repo / "drafts" / f"{task_id}.md").exists()
-    if pending_id:
-        run(["scripts/resolve_pending.py", pending_id, "approve", "--note", "validation suite approval"], env)
-    _run_worker_until_terminal(env)
-    run(["orchestrator/tick.py", "--once"], env)
+        pending = list_pending(env)
+        pending_id = pending[0]["id"] if pending else None
+        on_main_before_approval = (msg_repo / "outputs" / f"{task_id}.md").exists()
+        if pending_id:
+            run(["scripts/resolve_pending.py", pending_id, "approve", "--note", "validation suite approval"], env)
+        _run_worker_until_terminal(env)
+        run(["orchestrator/tick.py", "--once"], env)
 
-    artifact = msg_repo / "drafts" / f"{task_id}.md"
-    on_main_after_approval = artifact.exists() and artifact.stat().st_size > 0
-    content = artifact.read_text().lower() if on_main_after_approval else ""
-    mentions_message = "reschedul" in content or "friday" in content
-    final_status = read_task_status(task_id, env)
+        artifact = msg_repo / "outputs" / f"{task_id}.md"
+        exists_nonempty = artifact.exists() and artifact.stat().st_size > 0
+        content = artifact.read_text() if exists_nonempty else ""
+        first_line = content.splitlines()[0] if content else ""
+        results[label] = {
+            "reached_merge_wait": cycle_result.get("action") == "agent_completed_awaiting_merge",
+            "on_main_before_approval": on_main_before_approval,
+            "exists_nonempty": exists_nonempty,
+            "content": content,
+            "header_matches": first_line == expected_header,
+            "first_line": first_line,
+            "expected_header": expected_header,
+            "content_ok": exists_nonempty and content_checks[label](content),
+            "final_status": read_task_status(task_id, env),
+        }
 
-    ok = (
-        tools_differ
-        and result.get("action") == "agent_completed_awaiting_merge"
-        and not on_main_before_approval
-        and on_main_after_approval
-        and mentions_message
-        and final_status == "done"
+    ok = all(
+        r["reached_merge_wait"] and not r["on_main_before_approval"] and r["exists_nonempty"]
+        and r["header_matches"] and r["content_ok"] and r["final_status"] == "done"
+        for r in results.values()
     )
     record(
-        "9. two harnesses, demonstrably different behavior, same code path",
+        "9. three free-text requests through the identical task type/harness fire three different skills",
         ok,
-        f"respond_allowed_tools={respond_harness['allowed_tools']} (strict subset of review's {review_harness['allowed_tools']}: {tools_differ}), "
-        f"on_main_before={on_main_before_approval} (want False), on_main_after={on_main_after_approval}, "
-        f"mentions_named_message={mentions_message}, final_status={final_status!r}",
+        "; ".join(
+            f"{label}: header={r['first_line']!r} (want {r['expected_header']!r}), "
+            f"content_ok={r['content_ok']}, on_main_before={r['on_main_before_approval']} (want False), "
+            f"status={r['final_status']!r}"
+            for label, r in results.items()
+        ),
     )
 
 
-def _item10_summarize_period(msg_repo, env):
-    """Goal 6: the third task type, completing "all three task types
-    exercised through the normal dispatch path.
+def _item10_harness_and_skill_removal(msg_repo, env):
+    """Goal 1 (a single, capability-agnostic artifact_path_template,
+    inspected directly rather than assumed) and the acceptance criterion
+    for goal 2's "no duplicated Python" property: removing a SKILL.md
+    changes what the agent can do without touching any Python. Only the
+    message-respond skill is removed (temporarily, from the tracked seed,
+    restored in a finally block) and re-tried against a FRESH temp repo
+    so ensure_repo_bootstrapped() actually re-copies the seed without it.
     """
-    task_id = create_task(
-        "message-agent", "summarize_period", env,
-        payload={"start": "2026-07-12T00:00:00+00:00", "end": "2026-07-14T23:59:59+00:00"},
-    )
-    run(["orchestrator/tick.py", "--once"], env)
-    result = _run_worker_until_terminal(env)
+    harness = json.loads((REPO_ROOT / "harnesses" / "message-agent.json").read_text())
+    single_generic_path = harness.get("artifact_path_template") == "outputs/{task_id}.md"
+    only_one_harness_file = sorted(p.name for p in (REPO_ROOT / "harnesses").glob("*.json")) == ["message-agent.json"]
 
-    pending = list_pending(env)
-    pending_id = pending[0]["id"] if pending else None
-    if pending_id:
-        run(["scripts/resolve_pending.py", pending_id, "approve", "--note", "validation suite approval"], env)
-    _run_worker_until_terminal(env)
-    run(["orchestrator/tick.py", "--once"], env)
+    respond_skill_dir = REPO_ROOT / "workers" / "message-agent" / "seed" / ".claude" / "skills" / "message-respond"
+    moved_aside = respond_skill_dir.parent / "message-respond.disabled-for-test"
+    produced_respond_header_without_skill = None
+    try:
+        respond_skill_dir.rename(moved_aside)
+        with message_agent_env() as (base2, msg_repo2, env2):
+            task_id = create_task(
+                "message-agent", "handle_request", env2,
+                payload={"request": "Draft a reply to Dave's message about rescheduling Friday's meeting."},
+            )
+            run(["orchestrator/tick.py", "--once"], env2)
+            _run_worker_until_terminal(env2)
 
-    artifact = msg_repo / "summaries" / f"{task_id}.md"
-    exists_nonempty = artifact.exists() and artifact.stat().st_size > 0
-    content = artifact.read_text().lower() if exists_nonempty else ""
-    mentions_in_window_sender = "bob" in content or "carol" in content or "outage" in content or "newsletter" in content
-    final_status = read_task_status(task_id, env)
+            pending = list_pending(env2)
+            pending_id = pending[0]["id"] if pending else None
+            if pending_id:
+                run(["scripts/resolve_pending.py", pending_id, "approve", "--note", "validation suite approval"], env2)
+                _run_worker_until_terminal(env2)
+                run(["orchestrator/tick.py", "--once"], env2)
 
-    ok = (
-        result.get("action") == "agent_completed_awaiting_merge"
-        and exists_nonempty
-        and mentions_in_window_sender
-        and final_status == "done"
-    )
+            artifact = msg_repo2 / "outputs" / f"{task_id}.md"
+            if artifact.exists() and artifact.stat().st_size > 0:
+                first_line = artifact.read_text().splitlines()[0]
+                produced_respond_header_without_skill = first_line == "Handled by: message-respond skill"
+            else:
+                produced_respond_header_without_skill = False
+    finally:
+        if moved_aside.exists():
+            moved_aside.rename(respond_skill_dir)
+
+    skill_removal_changed_capability = produced_respond_header_without_skill is False
+
+    ok = single_generic_path and only_one_harness_file and skill_removal_changed_capability
     record(
-        "10. third task type (summarize_period) exercised through the normal dispatch path",
+        "10. single artifact path inspected directly, and removing a SKILL.md changes capability with zero Python touched",
         ok,
-        f"artifact_exists_nonempty={exists_nonempty}, mentions_a_message_in_window={mentions_in_window_sender}, final_status={final_status!r}",
+        f"artifact_path_template={harness.get('artifact_path_template')!r} (want 'outputs/{{task_id}}.md'), "
+        f"only_one_harness_file={only_one_harness_file}, "
+        f"produced_message-respond_header_without_its_skill={produced_respond_header_without_skill} (want False)",
     )
 
 
@@ -637,13 +689,13 @@ def item8_10_message_agent_suite():
         except Exception as e:
             record("8. agent-backed kill -9 mid-session: resumes the same session, not a restart", False, f"raised {type(e).__name__}: {e}")
         try:
-            _item9_harness_difference(msg_repo, env)
+            _item9_three_skills_fire(msg_repo, env)
         except Exception as e:
-            record("9. two harnesses, demonstrably different behavior, same code path", False, f"raised {type(e).__name__}: {e}")
+            record("9. three free-text requests through the identical task type/harness fire three different skills", False, f"raised {type(e).__name__}: {e}")
         try:
-            _item10_summarize_period(msg_repo, env)
+            _item10_harness_and_skill_removal(msg_repo, env)
         except Exception as e:
-            record("10. third task type (summarize_period) exercised through the normal dispatch path", False, f"raised {type(e).__name__}: {e}")
+            record("10. single artifact path inspected directly, and removing a SKILL.md changes capability with zero Python touched", False, f"raised {type(e).__name__}: {e}")
 
 
 def item11_base_suite_unaffected():

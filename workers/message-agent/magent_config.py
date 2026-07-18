@@ -52,9 +52,9 @@ def ensure_repo_bootstrapped(repo_dir: Path = None, seed_dir: Path = None) -> No
     repo_dir.mkdir(parents=True, exist_ok=True)
     shutil.copytree(seed_dir / "messages", repo_dir / "messages")
     shutil.copy(seed_dir / "CLAUDE.md", repo_dir / "CLAUDE.md")
-    for sub in ("reviews", "drafts", "summaries"):
-        (repo_dir / sub).mkdir(exist_ok=True)
-        (repo_dir / sub / ".gitkeep").touch()
+    shutil.copytree(seed_dir / ".claude", repo_dir / ".claude")
+    (repo_dir / "outputs").mkdir(exist_ok=True)
+    (repo_dir / "outputs" / ".gitkeep").touch()
 
     def _git(*args):
         subprocess.run(["git", "-C", str(repo_dir), *args], check=True, capture_output=True, text=True)
