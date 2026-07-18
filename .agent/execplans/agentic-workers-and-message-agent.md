@@ -169,11 +169,66 @@ new shared plumbing, new harness configs, one new worker.
   automatically**, since a linked worktree is a checkout of the same
   tracked tree at a given commit — no special handling needed for the
   agent's auto-loaded project context to be present inside a worktree.
-- No surprises were hit in the actual implementation phase beyond the two
-  spikes above — the spikes were deliberately run *before* writing this
-  plan's design so that the recovery design could be built around real
-  observed behavior rather than assumed behavior, per this plan's
-  `<context_gathering>` instruction to check what live testing is possible.
+- **A directory containing its own `.git` cannot be tracked as plain files
+  by an outer repository, even with `--separate-git-dir`.** Hit during
+  implementation, not anticipated in the original design: the first
+  attempt committed `workers/message-agent/repo/` (already `git init`'d,
+  with its seed commits) directly into this repository. `git add` silently
+  represented the entire directory as a single opaque gitlink (mode
+  `160000`) instead of tracking its files — the CLAUDE.md and message file
+  *content* were never actually recorded in this repository's history,
+  only a dangling reference to a commit hash nothing else has. Verified
+  the obvious-seeming fix (`git init --separate-git-dir=<sibling>`, which
+  moves the `.git` metadata out but leaves a small `.git` *file* pointing
+  to it) does NOT solve this either: a live empirical test showed the
+  outer repo still detects that path as an embedded repository and still
+  produces a gitlink, because git's detection is "does this path resolve
+  to a repository root," not "does a `.git` directory literally sit here."
+  **Fix:** split the concern. `workers/message-agent/seed/` (no nested
+  `.git`) holds the actual tracked, human-readable content — `CLAUDE.md`
+  and the real test message files — exactly the human-editable artifacts
+  goal 6 and the legibility principle care about. `workers/message-agent/
+  repo/`, the *live* git repository the worker actually runs worktree/
+  branch/commit/merge operations against, is git-ignored entirely (added
+  to `.gitignore` alongside `worktrees/`) and materialized from `seed/` by
+  `magent_config.ensure_repo_bootstrapped()` the first time it's needed —
+  idempotent, a no-op once `repo/.git` already exists, so it never
+  overwrites accumulated task history. This is the same "runtime state is
+  regenerable from tracked inputs, not itself committed" principle the
+  base system already applies to `state/`, `mailboxes/`, `heartbeats/`,
+  and `operator-pending/`, just applied one level deeper because this
+  particular runtime state happens to itself be a git repository. Caught
+  by actually running `git add` and reading its own warning output and
+  the resulting index entry, not by reasoning about it in the abstract —
+  the same "describe outcomes a person can observe and verify" discipline
+  the base plan's own Surprises & Discoveries section models.
+- **Two stale-in-memory-dict bugs, caught by re-reading the code before
+  ever running it, not by a test failure.** While writing
+  `run_agent_task_cycle`, two spots reused a Python `dict` variable after
+  the disk state it was read from had already changed: (1) after the
+  claim write flips `state.json`'s phase to `in_progress`, the code
+  originally kept reading `current_task_id` from the *pre-claim* `state`
+  dict captured at the top of the function, which would always be empty
+  on a task's very first cycle; (2) after generating a brand-new
+  `agent_session_id` and writing it to the task file, the code returned
+  `task.get("agent_session_id")` from the in-memory `task` dict, which
+  still reflected the pre-write value, so the very first cycle's result
+  would always report no session id even though one had just been
+  created and used. Both are exactly the kind of "which copy of the state
+  is this variable actually holding" mistake this codebase's own
+  discipline (re-read or re-bind after every write, never trust an
+  in-memory copy across a write it doesn't know about) exists to prevent;
+  fixed by re-binding `state` to `write_worker_state`'s own return value
+  and by updating `task["agent_session_id"]` immediately after the write
+  that sets it, before either variable was next read. Neither bug was
+  seen to fail at runtime — they were caught by re-reading the function
+  end to end and asking "is every variable read here actually current" —
+  but both would have surfaced immediately and confusingly in validation
+  item 8, which specifically depends on the returned `agent_session_id`
+  being accurate.
+- With those two fixes applied, the first real (non-spike) run of the
+  full dispatch → agent session → worktree isolation → merge gate →
+  approve → merge → cleanup pipeline succeeded on its first attempt.
 
 ## Decision Log
 
@@ -336,6 +391,20 @@ new shared plumbing, new harness configs, one new worker.
   given file belongs to; keeping `worktrees/<task_id>/` alongside `repo/`
   (both direct children of `workers/message-agent/`) avoids that entirely
   and matches how the base system already separates concerns by directory.
+- **`workers/message-agent/seed/` is tracked; `workers/message-agent/repo/`
+  and `worktrees/` are git-ignored and regenerated from it.** Found only
+  after actually trying to commit a live nested git repository into this
+  one and watching git silently reduce it to a dangling gitlink (see
+  Surprises & Discoveries for the full empirical finding, including why
+  `--separate-git-dir` doesn't help). The human-authored content this plan
+  actually needs tracked — `CLAUDE.md`, the real test message files — lives
+  in `seed/`, which has no nested `.git` and is therefore just plain files
+  like everything else in this repository. `repo/` is bootstrapped from
+  `seed/` on first use (`magent_config.ensure_repo_bootstrapped()`,
+  idempotent) and then accumulates real task branches and merge commits
+  over time — that accumulated history is exactly the kind of "runtime
+  state, not source" this repository already declines to commit for
+  `state/`, `mailboxes/`, `heartbeats/`, and `operator-pending/`.
 - **A worker-specific env var, `MESSAGE_AGENT_REPO_DIR`, overrides where
   this worker's git repo lives**, exactly mirroring how `ORCH_BASE_DIR`
   overrides the base system's state directories for tests. Without it,
@@ -640,19 +709,25 @@ new code is what happens inside this one worker's own cycle.
    `permission_mode: "bypassPermissions"` and have no git-capable tool at
    all (see Decision Log).
 
-3. **`workers/message-agent/repo/`** — initialized with `git init` and an
-   initial commit on `main` containing:
-   - `CLAUDE.md` — plain-language description of the worker's job (goal 6).
-   - `messages/.gitkeep`, `reviews/.gitkeep`, `drafts/.gitkeep`,
-     `summaries/.gitkeep` — the four subdirectories every harness's
-     `artifact_path_template` and prompt refer to.
+3. **`workers/message-agent/seed/`** — tracked, plain files, no git repo of
+   its own: `CLAUDE.md` (plain-language description of the worker's job,
+   goal 6) and `messages/` containing the real test message files (see
+   step 6). This is the human-readable source of truth.
 
 4. **`workers/message-agent/magent_config.py`** — this worker's own small
    config module, parallel in spirit to `orchestrator/config.py` but scoped
-   to this one worker: `REPO_DIR` (default `workers/message-agent/repo`,
-   overridable via `MESSAGE_AGENT_REPO_DIR` for tests, exactly like
-   `ORCH_BASE_DIR`), `WORKTREES_DIR` (`REPO_DIR`'s parent `/ "worktrees"`),
-   `WORKER_NAME = "message-agent"`.
+   to this one worker: `SEED_DIR` (`workers/message-agent/seed`),
+   `REPO_DIR` (default `workers/message-agent/repo`, overridable via
+   `MESSAGE_AGENT_REPO_DIR` for tests, exactly like `ORCH_BASE_DIR`),
+   `WORKTREES_DIR` (`REPO_DIR`'s parent `/ "worktrees"`), `WORKER_NAME =
+   "message-agent"`, and `ensure_repo_bootstrapped()` — if `REPO_DIR`
+   doesn't already have a `.git`, copy `SEED_DIR`'s content in, create the
+   `reviews/`/`drafts/`/`summaries/` subdirectories, `git init -b main`,
+   one initial commit; a no-op if `REPO_DIR/.git` already exists (see
+   Decision Log and Surprises & Discoveries for why `REPO_DIR` is
+   git-ignored rather than tracked directly). `worker.py` calls this once
+   at the top of every invocation, before scanning harnesses or running a
+   cycle.
 
 5. **`workers/message-agent/worker.py`** — the entrypoint script:
    - At startup, scans `harnesses/*.json`, keeps the ones with `worker ==
@@ -672,20 +747,21 @@ new code is what happens inside this one worker's own cycle.
      than inferring it.
 
 6. **Real message files** — created directly (not generated by an agent)
-   in `workers/message-agent/repo/messages/` for testing, committed to
-   `main`: at minimum three, spanning more than one day, so
-   `summarize_period` has a real time window to filter on and
-   `draft_response` has a real, named message to reply to. Exact content
-   documented in Artifacts and Notes.
+   in `workers/message-agent/seed/messages/`, tracked normally: four
+   messages spanning 2026-07-10 to 2026-07-16, so `summarize_period` has a
+   real time window to filter on and `draft_response` has a real, named
+   message to reply to. Exact content documented in Artifacts and Notes.
 
 7. **`scripts/run_validation.py`** — extended with four new items (8-11),
-   sharing one `_setup_message_agent_env()` helper that copies
-   `workers/message-agent/repo/` into a fresh temp directory (via
-   `shutil.copytree`, `.git` included) and sets both `ORCH_BASE_DIR` and
-   `MESSAGE_AGENT_REPO_DIR` to disposable temp paths, exactly mirroring the
-   existing `isolated_env` pattern. Items run in sequence against the same
-   temp repo (so branch/merge history accumulates realistically across
-   them, and so only one repo copy is made): item 8 (kill-9 recovery via
+   sharing one `_setup_message_agent_env()` helper that points
+   `MESSAGE_AGENT_REPO_DIR` at a fresh disposable temp path (not yet
+   existing) and lets `ensure_repo_bootstrapped()` materialize it from the
+   real, tracked `seed/` on first use — no copying of an existing `.git`
+   needed, since the bootstrap step already does exactly that
+   deterministically. Sets `ORCH_BASE_DIR` the same way, exactly mirroring
+   the existing `isolated_env` pattern. Items run in sequence against the
+   same temp repo (so branch/merge history accumulates realistically
+   across them, and so bootstrap only runs once): item 8 (kill-9 recovery via
    `review_messages`), item 9 (harness-difference via `draft_response`,
    also re-confirming worktree isolation on a second task type), item 10
    (`summarize_period`, the third task type, completing "all three task
@@ -865,8 +941,9 @@ task's own payload).
 describing summarizing a time window, and a `user_prompt_template`
 including `{start}`/`{end}`.
 
-**Message file format** (`workers/message-agent/repo/messages/
-<ISO-compact-ts>-<from-slug>-<subject-slug>.md`):
+**Message file format** (`workers/message-agent/seed/messages/
+<ISO-compact-ts>-<from-slug>-<subject-slug>.md`, copied into
+`workers/message-agent/repo/messages/` by `ensure_repo_bootstrapped()`):
 ```
 ---
 from: alice@example.com
@@ -904,15 +981,20 @@ harnesses/
   message-respond.json              harness for draft_response
   message-summarize.json            harness for summarize_period
 workers/message-agent/
-  magent_config.py                   REPO_DIR / WORKTREES_DIR, MESSAGE_AGENT_REPO_DIR override
+  magent_config.py                   SEED_DIR / REPO_DIR / WORKTREES_DIR, MESSAGE_AGENT_REPO_DIR override, ensure_repo_bootstrapped()
   worker.py                          entrypoint: --once / --loop / --stand-down
-  repo/                               this worker's own git repository, branch main
+  seed/                                TRACKED: human-authored source of truth, no nested .git
     CLAUDE.md                          plain-language description of the worker's job
-    messages/                          message files (see format above) — NOT mailboxes/
+    messages/                          the real test message files (see format above) — NOT mailboxes/
+  repo/                                GIT-IGNORED, runtime: bootstrapped from seed/, this worker's own
+                                        live git repository, branch main (see Decision Log/Surprises for why
+                                        this can't be tracked directly -- a nested .git can't be committed
+                                        as plain files by this outer repo)
+    CLAUDE.md, messages/                copied in from seed/ by ensure_repo_bootstrapped()
     reviews/                           review_messages output, one file per task
     drafts/                            draft_response output, one file per task
     summaries/                         summarize_period output, one file per task
-  worktrees/                          sibling of repo/; linked worktrees, one per in-flight task
+  worktrees/                          GIT-IGNORED, runtime: sibling of repo/; linked worktrees, one per in-flight task
 ```
 
 ## Interfaces and Dependencies
