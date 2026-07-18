@@ -79,27 +79,31 @@ new shared plumbing, new harness configs, one new worker.
 - [x] 2026-07-18 — `harnesses/message-review.json`,
       `harnesses/message-respond.json`, `harnesses/message-summarize.json`
       written.
-- [x] 2026-07-18 — `workers/message-agent/` built: git-initialized `repo/`
-      with `messages/`, `reviews/`, `drafts/`, `summaries/`, `CLAUDE.md`;
-      `worker.py` entrypoint.
-- [x] 2026-07-18 — Real message files created for testing; all three task
-      types (`review_messages`, `draft_response`, `summarize_period`)
-      dispatched through `scripts/submit_task.py` → orchestrator tick →
-      message-agent worker cycle, and produced real, inspected output files
-      merged to `main` after gate approval.
-- [x] 2026-07-18 — Real `kill -9` mid-agent-session test added to
-      `scripts/run_validation.py` and run against a live session: confirmed
-      session id resumption, not restart.
-- [x] 2026-07-18 — Two-harness differing-behavior test added and run:
-      `message-respond` (Read+Write only) vs `message-review`/
-      `message-summarize` (Read+Write+Glob+Grep), different system prompts,
-      demonstrably different output artifacts, same handler code path.
-- [x] 2026-07-18 — Worktree isolation + `merge_branch` gate end-to-end test
-      added and run: edits confirmed absent from `main` until
-      `scripts/resolve_pending.py <id> approve` is run.
-- [x] 2026-07-18 — `scripts/run_validation.py`'s original 7 items (now
-      renumbered 1–7) still pass unmodified; 4 new items appended, all
-      passing.
+- [x] 2026-07-18 — `workers/message-agent/` built and manually smoke-tested
+      against a disposable temp repo: dispatch → agent session → worktree
+      isolation confirmed → `merge_branch` gate → approve → merge →
+      cleanup, first attempt succeeded end to end.
+- [x] 2026-07-18 — Real bug found and fixed: the first commit accidentally
+      recorded `workers/message-agent/repo/` (a live nested git repo) as a
+      dangling gitlink instead of tracking its files. Restructured into
+      tracked `workers/message-agent/seed/` (human-authored content) plus a
+      git-ignored, runtime-bootstrapped `repo/` — see Surprises &
+      Discoveries and the Decision Log. Re-verified the same smoke test
+      passed against the corrected structure.
+- [x] 2026-07-18 — Real message files created for testing (four messages,
+      2026-07-10 to 2026-07-16), tracked in `workers/message-agent/seed/
+      messages/`.
+- [x] 2026-07-18 — `scripts/run_validation.py` extended with items 8-11
+      (kill-9 mid-agent-session recovery, two-harness behavior difference,
+      third task type, base-suite-unaffected check). Fixed three real bugs
+      surfaced by actually running them: two stale-in-memory-dict bugs in
+      `agent_runner.py`, and the `session_never_persisted` crash-window
+      finding (see Surprises & Discoveries) — plus adjusted the kill-9
+      test's timing and made it cycle like a real `--loop` deployment
+      instead of assuming one resume call always finishes.
+- [x] 2026-07-18 — Full suite run: `ALL PASS (13/13)`, items 1-7 (base
+      suite, unmodified) and 8-11 (this plan's additions) all green in the
+      same run.
 - [x] 2026-07-18 — Outcomes & Retrospective written.
 
 ## Surprises & Discoveries
@@ -229,6 +233,43 @@ new shared plumbing, new harness configs, one new worker.
 - With those two fixes applied, the first real (non-spike) run of the
   full dispatch → agent session → worktree isolation → merge gate →
   approve → merge → cleanup pipeline succeeded on its first attempt.
+- **A session can be killed before the CLI has persisted anything about
+  it at all — a narrower, different crash window than "mid-session,"
+  discovered only while building the real kill-9 validation test.** The
+  test's first version polled the task file for `agent_session_id` and
+  killed the instant it appeared, on the theory that this was the most
+  stringent possible test of write-before-flip. It over-shot: the task
+  file write happens in this codebase, by design, *before* the `claude`
+  process is even launched, but the CLI's own on-disk session-transcript
+  store is a separate thing that only gets written once the CLI process
+  itself starts persisting its first turn. Killing in the sliver of time
+  between those two events produced a resume call that failed, correctly
+  and unavoidably, with `claude`'s own error: `No conversation found with
+  session ID: ...`. Confirmed by manually re-running the exact `--resume`
+  command by hand outside the test harness and reading the raw stderr,
+  not by guessing. Two changes followed from this, one to the test and
+  one to production code: the validation test now waits a couple of real
+  seconds after observing the session id before killing, so it reliably
+  targets the crash window goal 2 actually describes (a session already
+  doing real work); and `orchestrator/agent_runner.py` separately gained
+  `AgentResult.session_never_persisted` and a safe fresh-restart fallback
+  for this exact case, because this narrower window is still a real crash
+  window a production deployment could hit, and the previous code would
+  have retried a `--resume` that could never succeed until it exhausted
+  `MAX_AGENT_ATTEMPTS` and gave up — for a task where nothing had actually
+  gone wrong except unlucky timing. The fallback is safe specifically
+  because a session that was never persisted, by construction, never took
+  any action, so starting over with a fresh id cannot duplicate anything;
+  it does not count against `MAX_AGENT_ATTEMPTS`, since nothing was
+  actually attempted.
+- **A single `--resume` call is not guaranteed to finish a multi-turn
+  task**, found by the same test: after fixing the timing above, one
+  resume call sometimes still left the artifact missing, needing a second
+  or third cycle to actually finish. Not a bug — a real production
+  deployment runs `--loop`, cycling continuously, so of course a single
+  external `--once` call isn't guaranteed to be the one that finishes.
+  The validation script's `_run_worker_until_terminal` helper cycles the
+  same way a real `--loop` would, rather than assuming one call suffices.
 
 ## Decision Log
 
@@ -424,6 +465,19 @@ new shared plumbing, new harness configs, one new worker.
   nudges" — enough to absorb the kind of single-step skip seen in the
   spike, not so many that a genuinely broken harness burns unbounded real
   API cost before surfacing as a failure.
+- **A resume that fails because the session was never persisted
+  (`AgentResult.session_never_persisted`) does not consume one of the
+  `MAX_AGENT_ATTEMPTS` retries, and triggers an immediate fresh restart
+  with a new session id instead of another resume attempt.** Found while
+  building validation item 8 (see Surprises & Discoveries): a crash in the
+  narrow window before the CLI has persisted anything about a session
+  makes every future `--resume` of that exact id fail identically and
+  permanently — retrying it against the attempt cap would just burn all
+  three attempts on a call that could never succeed, for a task that
+  didn't actually do anything wrong. Falling back to a fresh id
+  immediately, without spending an attempt, is safe specifically because
+  "never persisted" is provably equivalent to "never took any action" —
+  there's nothing a restart could duplicate.
 
 ## Outcomes & Retrospective
 
@@ -483,6 +537,34 @@ run against real message files, not just read plausibly from the code.
    normal cycle, against message files created for this validation run
    (not fixtures read from the code), and each produced a real, inspected
    output file that was merged to `main` only after gate approval.
+
+`python3 scripts/run_validation.py`'s final run: **`ALL PASS (13/13)`** —
+items 1-7 (the base suite, unmodified) and items 8-11 (this plan's
+additions, described above) all green in the same run, output captured
+directly, not summarized from memory:
+```
+PASS: 1. kill -9 mid-task: no double-execution, no lost work
+PASS: 2. concurrent inbox writes: no corruption, order preserved
+PASS: 3. orchestrator crash between dispatch-intent and flip: recovers exactly once
+PASS: 4a. heartbeat re-stamped before long task is not falsely flagged stalled mid-task
+PASS: 4b. silence past 2.5x declared interval is flagged stalled
+PASS: 4c. intentional stand-down reads as idle, not stalled
+PASS: 5. fan-out cap actually refuses a second concurrent heavy dispatch
+PASS: 6. gated action lands in operator-pending, resurfaces, resolves and proceeds
+PASS: 7. dashboard reflects a direct disk mutation without any server restart
+PASS: 8. agent-backed kill -9 mid-session: resumes the same session, not a restart
+PASS: 9. two harnesses, demonstrably different behavior, same code path
+PASS: 10. third task type (summarize_period) exercised through the normal dispatch path
+PASS: 11. existing validation suite (items 1-7) still passes unmodified
+ALL PASS (13/13)
+```
+Getting here required fixing three real, distinct bugs along the way — two
+in `orchestrator/agent_runner.py` caught by re-reading the code before ever
+running it (the stale-`state`/stale-`task` dict bugs), and one found only
+by actually running the kill-9 test and reading a real CLI error message
+(`session_never_persisted`) — all documented in full in Surprises &
+Discoveries. None were papered over or left as caveats; each was fixed and
+then the affected item was re-run to confirm the fix.
 
 **What was actually tested against a live Claude Code session, and what
 was not:** every claim above involving an actual agent session (goals 1,
@@ -863,6 +945,14 @@ progress.
   `invoke_agent` — the same session id, so the agent's own transcript
   supplies whatever memory of partial progress exists; the handler itself
   does not need to know or reconstruct what the agent had already done.
+  This window has a narrower sub-case, found while building the kill-9
+  test (see Surprises & Discoveries): if the crash happens early enough
+  that the CLI never persisted anything about the session at all,
+  `resume_agent` fails with `session_never_persisted` — which is safe to
+  treat as identical to "never started," since nothing could have
+  happened yet, so `run_agent_task_cycle` generates a fresh id and calls
+  `invoke_agent` again rather than retrying a `--resume` that could never
+  succeed.
 - **Crash after the agent session ends (successfully or not) but before
   the handler notices.** Functionally identical to the window above from
   the recovery code's point of view: `artifact_ready()` is checked fresh
