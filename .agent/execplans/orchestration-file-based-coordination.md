@@ -40,7 +40,7 @@ recomputed fresh on every request.
 - [x] 2026-07-18 — Gates config (`gates.json`) and operator-pending helpers (`orchestrator/gates.py`). Smoke-tested (is_gated hit/miss, file/list/resolve pending, get_resolved).
 - [x] 2026-07-18 — Orchestrator tick loop (`orchestrator/tick.py`): Gather/Process-inbox/Advance/Render, dispatch journal, fan-out cap. Directly exercised all three dispatch-journal crash windows (never sent, sent-not-flipped, flipped-not-committed) and the fan-out cap — all recovered/enforced correctly; see Surprises & Discoveries.
 - [x] 2026-07-18 — Example workers (`examples/worker_common.py`, `examples/fast_worker.py`, `examples/slow_worker.py`). Directly exercised: baseline dispatch/claim/complete, the gate path end to end (file pending -> approve -> resume -> complete), and `kill -9` mid-heavy-task recovery (state showed `in_progress` before and after the kill; fresh process resumed and completed exactly once, verified via `done/` containing exactly one file per task). Also found and fixed a real bug here — see Surprises & Discoveries.
-- [ ] Dashboard (`dashboard/server.py`, `dashboard/index.html`).
+- [x] 2026-07-18 — Dashboard (`dashboard/server.py`, `dashboard/index.html`). Verified live in an actual browser against seeded disposable data, not just by reading the code: worker table correctly showed real staleness (orchestrator/fast-worker genuinely stalled relative to their declared interval, slow-worker correctly "no heartbeat yet"), fan-out cap and task tables matched disk state, and the Approve flow was driven end to end (typed a note, clicked Approve, confirmed the pending item moved to `operator-pending/resolved/` on disk with that exact note). Found and fixed two real bugs in the process — see Surprises & Discoveries.
 - [ ] Operator CLI scripts (`scripts/submit_task.py`, `scripts/resolve_pending.py`).
 - [ ] Validation suite (`scripts/run_validation.sh`) covering every item in Validation and Acceptance, run and passing.
 - [ ] Outcomes & Retrospective written; final summary delivered; gates config flagged for operator review.
@@ -78,6 +78,24 @@ appended below as they occur.)*
   the documented command, not by reading the code -- a reminder that
   "the code compiles" and "the documented command works" are genuinely
   different claims.
+- **Real bug found and fixed (dashboard, blocking dialog)**: the Approve/
+  Deny buttons originally used a synchronous `prompt()` for the optional
+  resolution note. In the automated browser used to test this, `prompt()`
+  hung indefinitely with no error and no network request ever fired --
+  and independent of that environment quirk, a blocking native dialog on
+  every approve/deny click is poor dashboard UX regardless. Replaced with
+  a plain inline `<input>` per pending item; the button reads its value
+  directly, no blocking call at all.
+- **Real bug found and fixed (dashboard, clobbered input)**: the
+  operator-pending section rebuilt its `innerHTML` unconditionally on
+  every 3-second poll, which meant a human mid-way through typing a note
+  would have it silently erased by the next poll. Fixed by only rebuilding
+  that section when the *set* of pending item ids actually changed
+  (an item appeared or got resolved), leaving the DOM -- and any
+  in-progress note text -- untouched on quiet polls. Same "only act on
+  actual change" principle the orchestrator's own Render step uses,
+  applied client-side; found only by actually typing into the field
+  in a live browser and watching it vanish, not by reading the code.
 - Python's `time.time()`-based ISO timestamps need explicit UTC and
   microsecond precision for mailbox filename ordering to be unambiguous
   under rapid sends; using `datetime.now(timezone.utc)` with

@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orchestration Dashboard</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --ok: #1a7f37;
+    --stalled: #c22626;
+    --stood-down: #6e7781;
+    --unknown: #9a6700;
+    --border: color-mix(in srgb, currentColor 15%, transparent);
+    --bg-soft: color-mix(in srgb, currentColor 5%, transparent);
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 1100px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    line-height: 1.4;
+  }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 2.2rem; border-bottom: 1px solid var(--border); padding-bottom: .3rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-weight: 600; opacity: .7; }
+  code { font-size: .8em; background: var(--bg-soft); padding: .1em .35em; border-radius: 3px; }
+  .badge { display: inline-block; padding: .1em .55em; border-radius: 999px; font-size: .78rem; font-weight: 600; color: white; }
+  .badge.ok { background: var(--ok); }
+  .badge.stalled { background: var(--stalled); }
+  .badge.stood-down { background: var(--stood-down); }
+  .badge.unknown { background: var(--unknown); }
+  .muted { opacity: .6; }
+  .empty { opacity: .55; font-style: italic; padding: .5rem 0; }
+  button { cursor: pointer; border-radius: 5px; border: 1px solid var(--border); padding: .25rem .7rem; font-size: .8rem; margin-right: .3rem; }
+  button.approve { background: var(--ok); color: white; border-color: var(--ok); }
+  button.deny { background: var(--stalled); color: white; border-color: var(--stalled); }
+  #meta { opacity: .6; font-size: .8rem; }
+  details summary { cursor: pointer; opacity: .75; }
+  pre { font-size: .78rem; background: var(--bg-soft); padding: .6rem; border-radius: 6px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>Orchestration Dashboard</h1>
+<div id="meta">loading…</div>
+
+<h2>Workers</h2>
+<table id="workers-table">
+  <thead><tr><th>Worker</th><th>Phase</th><th>Heartbeat</th><th>Age / Threshold</th><th>Inbox</th><th>Done</th><th>Summary</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Tasks <span id="task-counts" class="muted"></span></h2>
+<table id="tasks-table">
+  <thead><tr><th>Task</th><th>Worker</th><th>Type</th><th>Heavy</th><th>Status</th><th>Created</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Operator-pending (needs a human)</h2>
+<div id="pending-list"></div>
+
+<h2>Human gates configuration <span class="muted">(gates.json — edit the file to change policy)</span></h2>
+<div id="gates-list"></div>
+
+<script>
+const REFRESH_MS = 3000;
+
+function fmtAge(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  if (seconds < 60) return seconds.toFixed(1) + "s";
+  if (seconds < 3600) return (seconds / 60).toFixed(1) + "m";
+  return (seconds / 3600).toFixed(1) + "h";
+}
+
+function heartbeatBadge(hb) {
+  if (!hb.found) return '<span class="badge unknown">no heartbeat yet</span>';
+  const status = hb.heartbeat.status;
+  if (status === "stood_down") return '<span class="badge stood-down">stood down</span>';
+  if (hb.is_stalled) return '<span class="badge stalled">STALLED</span>';
+  return '<span class="badge ok">ok</span>';
+}
+
+function renderWorkers(snapshot) {
+  const rows = [];
+  const all = [snapshot.orchestrator, ...snapshot.workers];
+  for (const w of all) {
+    const hb = w.heartbeat;
+    const ageStr = hb.found ? `${fmtAge(hb.age_seconds)} / ${fmtAge(hb.threshold_seconds)}` : "—";
+    const summary = hb.found ? (hb.heartbeat.summary || "") : "";
+    rows.push(`<tr>
+      <td><strong>${w.worker}</strong></td>
+      <td>${w.state.phase || "—"}</td>
+      <td>${heartbeatBadge(hb)}</td>
+      <td>${ageStr}</td>
+      <td>${w.inbox_count}</td>
+      <td>${w.done_count}</td>
+      <td class="muted">${summary}</td>
+    </tr>`);
+  }
+  document.querySelector("#workers-table tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="empty">no workers yet</td></tr>`;
+}
+
+function renderTasks(snapshot) {
+  document.getElementById("task-counts").textContent =
+    "(" + Object.entries(snapshot.task_counts).map(([k, v]) => `${k}: ${v}`).join(", ") +
+    `, heavy in flight: ${snapshot.heavy_in_flight}/${snapshot.max_concurrent_heavy})`;
+  const rows = snapshot.tasks
+    .slice()
+    .sort((a, b) => (a.created_ts || "").localeCompare(b.created_ts || ""))
+    .map(t => `<tr>
+      <td><code>${t.id.replace("task-", "")}</code></td>
+      <td>${t.worker}</td>
+      <td>${t.type}</td>
+      <td>${t.heavy ? "yes" : ""}</td>
+      <td>${t.status}</td>
+      <td class="muted">${(t.created_ts || "").replace("T", " ").slice(0, 19)}</td>
+    </tr>`);
+  document.querySelector("#tasks-table tbody").innerHTML = rows.join("") || `<tr><td colspan="6" class="empty">no tasks yet</td></tr>`;
+}
+
+async function resolve(pendingId, decision) {
+  const noteInput = document.getElementById(`note-${pendingId}`);
+  const note = noteInput ? noteInput.value : "";
+  const res = await fetch("/api/resolve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pending_id: pendingId, decision, resolved_by: "dashboard-operator", note }),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    alert("Failed to resolve: " + err.error);
+    return;
+  }
+  await refresh();
+}
+window.resolve = resolve;
+
+let lastPendingIds = null;
+
+function renderPending(snapshot) {
+  // Rebuilding this section's innerHTML on every poll would wipe out any
+  // note a human is actively typing mid-interaction. Only rebuild when
+  // the SET of pending items actually changed (one appeared, one got
+  // resolved); leave the DOM (and any in-progress note text) alone
+  // otherwise. Same "only render on change" idea as the orchestrator's
+  // own Render step, applied client-side.
+  const ids = snapshot.operator_pending.map(p => p.id).sort().join(",");
+  if (ids === lastPendingIds) return;
+  lastPendingIds = ids;
+
+  const el = document.getElementById("pending-list");
+  if (!snapshot.operator_pending.length) {
+    el.innerHTML = `<div class="empty">nothing waiting on a human right now</div>`;
+    return;
+  }
+  el.innerHTML = snapshot.operator_pending.map(p => `
+    <div style="border:1px solid var(--border); border-radius:8px; padding:.7rem 1rem; margin-bottom:.6rem;">
+      <div><strong>${p.action_type}</strong> <span class="muted">(${p.category || "uncategorized"})</span> — requested by <code>${p.requested_by}</code></div>
+      <div class="muted" style="margin:.3rem 0;">${p.description}</div>
+      <details><summary>payload</summary><pre>${JSON.stringify(p.payload, null, 2)}</pre></details>
+      <div style="margin:.4rem 0;">
+        <input id="note-${p.id}" type="text" placeholder="optional note" style="width:16rem; padding:.25rem .5rem; border-radius:5px; border:1px solid var(--border); background:transparent; color:inherit;">
+      </div>
+      <button class="approve" onclick="resolve('${p.id}','approved')">Approve</button>
+      <button class="deny" onclick="resolve('${p.id}','denied')">Deny</button>
+    </div>
+  `).join("");
+}
+
+function renderGates(snapshot) {
+  const el = document.getElementById("gates-list");
+  el.innerHTML = `<table><thead><tr><th>action_type</th><th>category</th><th>reason</th></tr></thead><tbody>` +
+    snapshot.gates_config.map(g => `<tr><td><code>${g.action_type}</code></td><td>${g.category}</td><td class="muted">${g.reason}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+async function refresh() {
+  const res = await fetch("/api/snapshot");
+  const snapshot = await res.json();
+  document.getElementById("meta").textContent =
+    `Generated ${snapshot.generated_ts} — recomputed fresh from disk on every request, nothing cached.`;
+  renderWorkers(snapshot);
+  renderTasks(snapshot);
+  renderPending(snapshot);
+  renderGates(snapshot);
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
