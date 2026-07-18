@@ -42,7 +42,7 @@ recomputed fresh on every request.
 - [x] 2026-07-18 — Example workers (`examples/worker_common.py`, `examples/fast_worker.py`, `examples/slow_worker.py`). Directly exercised: baseline dispatch/claim/complete, the gate path end to end (file pending -> approve -> resume -> complete), and `kill -9` mid-heavy-task recovery (state showed `in_progress` before and after the kill; fresh process resumed and completed exactly once, verified via `done/` containing exactly one file per task). Also found and fixed a real bug here — see Surprises & Discoveries.
 - [x] 2026-07-18 — Dashboard (`dashboard/server.py`, `dashboard/index.html`). Verified live in an actual browser against seeded disposable data, not just by reading the code: worker table correctly showed real staleness (orchestrator/fast-worker genuinely stalled relative to their declared interval, slow-worker correctly "no heartbeat yet"), fan-out cap and task tables matched disk state, and the Approve flow was driven end to end (typed a note, clicked Approve, confirmed the pending item moved to `operator-pending/resolved/` on disk with that exact note). Found and fixed two real bugs in the process — see Surprises & Discoveries.
 - [x] 2026-07-18 — Operator CLI scripts (`scripts/submit_task.py`, `scripts/resolve_pending.py`). Smoke-tested directly (create a task via CLI, read it back; file+resolve a pending item via CLI, confirm resolved copy on disk).
-- [ ] Validation suite (`scripts/run_validation.sh`) covering every item in Validation and Acceptance, run and passing.
+- [x] 2026-07-18 — Validation suite (`scripts/run_validation.py`) covering every item in Validation and Acceptance, run against real subprocesses (`kill -9` on an actual PID, real concurrent Python processes, a real HTTP server) with isolated disposable state per item. **ALL PASS (9/9)** on a clean run.
 - [ ] Outcomes & Retrospective written; final summary delivered; gates config flagged for operator review.
 
 ## Surprises & Discoveries
@@ -169,6 +169,16 @@ appended below as they occur.)*
   requests; restarting it has zero effect on correctness, only on
   availability. All staleness math (2.5x check) is computed at request
   time from the heartbeat's `ts` and `interval_seconds`, never cached.
+- **`scripts/run_validation.py` instead of the originally-planned
+  `run_validation.sh`.** Several validation items need precise subprocess
+  control (sending an actual `SIGKILL` to a specific PID mid-task,
+  running two senders truly concurrently via `Popen` without waiting,
+  passing structured JSON payloads between steps, parsing JSON responses
+  from the dashboard's HTTP API). All of that is native and safe in
+  Python (`subprocess`, `signal`, `json`) and would be fragile,
+  quote-escaping-heavy shell in bash. Switched before writing any of it,
+  not after hitting trouble -- the criteria themselves made the choice
+  obvious once it came time to implement them.
 - **Human-gates default list.** See `gates.json` and the callout in the
   final summary — this is the one item in this plan that is a proposal
   for the operator to review, not a finalized decision, per the
@@ -236,7 +246,7 @@ dashboard/
 scripts/                  operator-facing and test-facing CLI helpers
   submit_task.py             enqueue a task for a worker (testing/ops)
   resolve_pending.py         approve/deny an operator-pending item
-  run_validation.sh          exercises every Validation & Acceptance item
+  run_validation.py          exercises every Validation & Acceptance item
 gates.json                the editable, reviewable human-gates config
 state/<worker>/state.json               per-worker durable state
 state/orchestrator/tasks/<id>.json      durable task queue entries
@@ -490,7 +500,7 @@ tracing through abstractions.
     thin wrapper over `gates.resolve_pending`, the non-dashboard way for
     an operator to clear a gate.
 
-13. **`scripts/run_validation.sh`** — drives every item in Validation and
+13. **`scripts/run_validation.py`** — drives every item in Validation and
     Acceptance below in sequence, printing `PASS`/`FAIL` per item and
     exiting non-zero on any failure. This is what actually gets run to
     call goal 6 and the self-reflection bar satisfied, not a description
@@ -499,7 +509,7 @@ tracing through abstractions.
 ## Validation and Acceptance
 
 Each item below is both an acceptance criterion from the prompt and a
-concrete, scripted step in `scripts/run_validation.sh`. All commands are
+concrete, scripted step in `scripts/run_validation.py`. All commands are
 run from the repository root.
 
 1. **Kill-and-recover mid-task, no double-execution, no lost work.**
@@ -563,7 +573,7 @@ run from the repository root.
    second response reflects the mutation, proving the server holds no
    stale in-memory cache.
 
-`scripts/run_validation.sh` runs all seven in sequence against a
+`scripts/run_validation.py` runs all seven in sequence against a
 disposable validation data root (via an env var overriding
 `orchestrator/config.py`'s base paths) so it never touches the example
 fixtures' real state between runs, and prints a final `ALL PASS` or lists
