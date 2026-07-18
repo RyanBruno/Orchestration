@@ -64,6 +64,21 @@ class AgentResult:
     raw: dict
     stderr_tail: str
 
+    @property
+    def session_never_persisted(self) -> bool:
+        """True if a --resume call failed because the CLI never actually
+        wrote anything for this session id -- possible if a crash lands in
+        the narrow window between "we chose and durably recorded this
+        session id" and "Claude Code's own on-disk session store has
+        persisted its first turn" (found via a live test: killing at the
+        earliest possible instant produced exactly this CLI error: "No
+        conversation found with session ID: ..."). Safe to treat as
+        equivalent to "never started": if the session was never
+        persisted, by definition no action was ever taken under it, so
+        starting fresh with a new id cannot duplicate any side effect.
+        """
+        return not self.ok and "No conversation found" in self.stderr_tail
+
 
 def _harness_argv(harness: dict) -> list:
     """Flags derived from a harness config, shared by fresh-start and
@@ -448,7 +463,22 @@ def run_agent_task_cycle(worker: str, repo_dir: Path, worktrees_dir: Path, harne
                     return {"action": "agent_gave_up", "task_id": task_id, "agent_session_id": task.get("agent_session_id")}
                 ctx.heartbeat(harness["expected_duration_seconds"] + harness["heartbeat_buffer_seconds"], f"resuming agent session for {task_id}")
                 result = resume_agent(harness, worktree_path, task["agent_session_id"])
-                tick.write_task(task_id, agent_attempt=attempt + 1)
+                if result.session_never_persisted:
+                    # The crash landed before Claude Code's own on-disk
+                    # session store had persisted anything for this id --
+                    # by definition no action was ever taken under it, so
+                    # starting fresh with a NEW id is safe (nothing to
+                    # duplicate) and is the only way to make progress,
+                    # since resuming a session that was never created can
+                    # never succeed no matter how many times it's retried.
+                    # Does not count against MAX_AGENT_ATTEMPTS -- nothing
+                    # actually ran.
+                    session_id = str(uuid.uuid4())
+                    tick.write_task(task_id, agent_session_id=session_id, agent_started_ts=common.now_iso())
+                    task["agent_session_id"] = session_id
+                    result = invoke_agent(harness, render_prompt(harness, task), worktree_path, session_id)
+                else:
+                    tick.write_task(task_id, agent_attempt=attempt + 1)
 
             if not artifact_ready(worktree_path, artifact_rel):
                 return {"action": "agent_ran_no_artifact_yet", "task_id": task_id, "agent_session_id": result.session_id or task.get("agent_session_id")}
